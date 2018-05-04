@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	testIterationCount = 100
+	testIterationCount = 1000
 )
 
 func testPutItem(t *testing.T, sp *StoragePackerV2, entity *identity.Entity) {

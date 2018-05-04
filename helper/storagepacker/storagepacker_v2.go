@@ -63,6 +63,8 @@ type StoragePackerV2 struct {
 	bucketsCache *radix.Tree
 }
 
+// LockedBucket embeds a bucket and its corresponding lock to ensure thread
+// safety
 type LockedBucket struct {
 	*BucketV2
 	lock *sync.RWMutex
@@ -90,7 +92,7 @@ func (b *BucketV2) Clone() (*BucketV2, error) {
 
 // putItem is a recursive function that finds the appropriate bucket
 // to store the item based on the storage space available in the buckets.
-func (s *StoragePackerV2) putItem(bucket *LockedBucket, item *Item) (string, error) {
+func (s *StoragePackerV2) putItem(bucket *LockedBucket, item *Item, depth int) (string, error) {
 	// Bucket will be nil for the first time when its not known which base
 	// level bucket the item belongs to.
 	if bucket == nil {
@@ -111,7 +113,8 @@ func (s *StoragePackerV2) putItem(bucket *LockedBucket, item *Item) (string, err
 
 		// If the base bucket does not exist, create one
 		if bucket == nil {
-			bucket = s.newBucket(baseKey, 0)
+			bucket = s.newBucket(baseKey)
+			depth = 0
 		}
 	}
 
@@ -121,7 +124,7 @@ func (s *StoragePackerV2) putItem(bucket *LockedBucket, item *Item) (string, err
 	}
 
 	// Compute the shard index to which the item belongs
-	shardIndex, err := shardBucketIndex(item.ID, int(bucket.Depth), int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
+	shardIndex, err := shardBucketIndex(item.ID, depth, int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
 	if err != nil {
 		return "", errwrap.Wrapf("failed to compute the bucket shard index: {{err}}", err)
 	}
@@ -135,14 +138,14 @@ func (s *StoragePackerV2) putItem(bucket *LockedBucket, item *Item) (string, err
 		if err != nil {
 			return "", err
 		}
-		return s.putItem(bucketShard, item)
+		return s.putItem(bucketShard, item, depth+1)
 	}
 
 	defer bucket.lock.Unlock()
 
 	bucketShard, ok := bucket.Buckets[shardIndex]
 	if !ok {
-		bucketShard = s.newBucket(shardKey, bucket.Depth+1).BucketV2
+		bucketShard = s.newBucket(shardKey).BucketV2
 		bucket.Buckets[shardIndex] = bucketShard
 	}
 
@@ -162,7 +165,7 @@ func (s *StoragePackerV2) putItem(bucket *LockedBucket, item *Item) (string, err
 		return bucketShard.Key, s.PutBucket(bucket)
 	}
 
-	err = s.splitBucket(bucket)
+	err = s.splitBucket(bucket, depth)
 	if err != nil {
 		return "", err
 	}
@@ -172,7 +175,7 @@ func (s *StoragePackerV2) putItem(bucket *LockedBucket, item *Item) (string, err
 		return "", err
 	}
 
-	bucketKey, err := s.putItem(shardedBucket, item)
+	bucketKey, err := s.putItem(shardedBucket, item, depth+1)
 	if err != nil {
 		return "", err
 	}
@@ -269,7 +272,7 @@ func (s *StoragePackerV2) PutBucket(bucket *LockedBucket) error {
 
 // getItem is a recursive function that fetches the given item ID in
 // the bucket hierarchy
-func (s *StoragePackerV2) getItem(bucket *LockedBucket, itemID string) (*Item, error) {
+func (s *StoragePackerV2) getItem(bucket *LockedBucket, itemID string, depth int) (*Item, error) {
 	if bucket == nil {
 		baseIndex, err := s.baseBucketIndex(itemID)
 		if err != nil {
@@ -280,13 +283,15 @@ func (s *StoragePackerV2) getItem(bucket *LockedBucket, itemID string) (*Item, e
 		if err != nil {
 			return nil, errwrap.Wrapf("failed to read packed storage item: {{err}}", err)
 		}
+
+		depth = 0
 	}
 
 	if bucket == nil {
 		return nil, nil
 	}
 
-	shardIndex, err := shardBucketIndex(itemID, int(bucket.Depth), int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
+	shardIndex, err := shardBucketIndex(itemID, depth, int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
 	if err != nil {
 		return nil, errwrap.Wrapf("failed to compute the bucket shard index: {{err}}", err)
 	}
@@ -301,7 +306,7 @@ func (s *StoragePackerV2) getItem(bucket *LockedBucket, itemID string) (*Item, e
 		if err != nil {
 			return nil, err
 		}
-		return s.getItem(bucketShard, itemID)
+		return s.getItem(bucketShard, itemID, depth+1)
 	}
 
 	defer bucket.lock.RUnlock()
@@ -316,7 +321,7 @@ func (s *StoragePackerV2) getItem(bucket *LockedBucket, itemID string) (*Item, e
 
 // deleteItem is a recursive function that finds the bucket holding
 // the item and removes the item from it
-func (s *StoragePackerV2) deleteItem(bucket *LockedBucket, itemID string) error {
+func (s *StoragePackerV2) deleteItem(bucket *LockedBucket, itemID string, depth int) error {
 	if bucket == nil {
 		baseIndex, err := s.baseBucketIndex(itemID)
 		if err != nil {
@@ -327,13 +332,15 @@ func (s *StoragePackerV2) deleteItem(bucket *LockedBucket, itemID string) error 
 		if err != nil {
 			return errwrap.Wrapf("failed to read packed storage item: {{err}}", err)
 		}
+
+		depth = 0
 	}
 
 	if bucket == nil {
 		return nil
 	}
 
-	shardIndex, err := shardBucketIndex(itemID, int(bucket.Depth), int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
+	shardIndex, err := shardBucketIndex(itemID, depth, int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
 	if err != nil {
 		return errwrap.Wrapf("failed to compute the bucket shard index: {{err}}", err)
 	}
@@ -348,7 +355,7 @@ func (s *StoragePackerV2) deleteItem(bucket *LockedBucket, itemID string) error 
 		if err != nil {
 			return err
 		}
-		return s.deleteItem(bucketShard, itemID)
+		return s.deleteItem(bucketShard, itemID, depth+1)
 	}
 
 	defer bucket.lock.Unlock()
@@ -369,7 +376,7 @@ func (s *StoragePackerV2) GetItem(itemID string) (*Item, error) {
 		return nil, fmt.Errorf("empty item ID")
 	}
 
-	return s.getItem(nil, itemID)
+	return s.getItem(nil, itemID, 0)
 }
 
 // PutItem persists the given item
@@ -382,7 +389,7 @@ func (s *StoragePackerV2) PutItem(item *Item) (string, error) {
 		return "", fmt.Errorf("missing ID in item")
 	}
 
-	return s.putItem(nil, item)
+	return s.putItem(nil, item, 0)
 }
 
 // DeleteItem removes the item using the given item identifier
@@ -391,7 +398,7 @@ func (s *StoragePackerV2) DeleteItem(itemID string) error {
 		return fmt.Errorf("empty item ID")
 	}
 
-	return s.deleteItem(nil, itemID)
+	return s.deleteItem(nil, itemID, 0)
 }
 
 // bucketExceedsSizeLimit indicates if the given bucket is exceeding the
@@ -448,20 +455,20 @@ func (s *StoragePackerV2) BucketWalk(key string, fn BucketWalkFunc) error {
 	return nil
 }
 
-func (s *StoragePackerV2) splitBucket(bucket *LockedBucket) error {
+func (s *StoragePackerV2) splitBucket(bucket *LockedBucket, depth int) error {
 	for _, shard := range bucket.Buckets {
 		for itemID, item := range shard.Items {
 			if shard.Buckets == nil {
 				shard.Buckets = make(map[string]*BucketV2)
 			}
-			subShardIndex, err := shardBucketIndex(itemID, int(shard.Depth), int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
+			subShardIndex, err := shardBucketIndex(itemID, depth+1, int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
 			if err != nil {
 				return err
 			}
 			subShard, ok := shard.Buckets[subShardIndex]
 			if !ok {
 				subShardKey := shard.Key + "/" + subShardIndex
-				subShard = s.newBucket(subShardKey, shard.Depth+1).BucketV2
+				subShard = s.newBucket(subShardKey).BucketV2
 				shard.Buckets[subShardIndex] = subShard
 			}
 			subShard.Items[itemID] = item
@@ -517,14 +524,13 @@ func bitsNeeded(value int) int {
 	return int(math.Ceil(math.Log2(float64(value))))
 }
 
-func (s *StoragePackerV2) newBucket(key string, depth int32) *LockedBucket {
+func (s *StoragePackerV2) newBucket(key string) *LockedBucket {
 	return &LockedBucket{
 		lock: &sync.RWMutex{},
 		BucketV2: &BucketV2{
 			Key:     key,
 			Buckets: make(map[string]*BucketV2),
 			Items:   make(map[string]*Item),
-			Depth:   depth,
 		},
 	}
 }
