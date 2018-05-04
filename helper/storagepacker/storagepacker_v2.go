@@ -64,8 +64,8 @@ type StoragePackerV2 struct {
 }
 
 type LockedBucket struct {
-	sync.RWMutex
-	Data *BucketV2
+	*BucketV2
+	lock *sync.RWMutex
 }
 
 // Clone creates a replica of the bucket
@@ -111,9 +111,7 @@ func (s *StoragePackerV2) putItem(bucket *LockedBucket, item *Item) (string, err
 
 		// If the base bucket does not exist, create one
 		if bucket == nil {
-			bucket = &LockedBucket{
-				Data: s.newBucket(baseKey, 0),
-			}
+			bucket = s.newBucket(baseKey, 0)
 		}
 	}
 
@@ -123,16 +121,16 @@ func (s *StoragePackerV2) putItem(bucket *LockedBucket, item *Item) (string, err
 	}
 
 	// Compute the shard index to which the item belongs
-	shardIndex, err := shardBucketIndex(item.ID, int(bucket.Data.Depth), int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
+	shardIndex, err := shardBucketIndex(item.ID, int(bucket.Depth), int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
 	if err != nil {
 		return "", errwrap.Wrapf("failed to compute the bucket shard index: {{err}}", err)
 	}
-	shardKey := bucket.Data.Key + "/" + shardIndex
+	shardKey := bucket.Key + "/" + shardIndex
 
-	bucket.Lock()
+	bucket.lock.Lock()
 
-	if bucket.Data.Sharded {
-		bucket.Unlock()
+	if bucket.Sharded {
+		bucket.lock.Unlock()
 		bucketShard, err := s.GetBucket(shardKey)
 		if err != nil {
 			return "", err
@@ -140,16 +138,16 @@ func (s *StoragePackerV2) putItem(bucket *LockedBucket, item *Item) (string, err
 		return s.putItem(bucketShard, item)
 	}
 
-	defer bucket.Unlock()
+	defer bucket.lock.Unlock()
 
-	bucketShard, ok := bucket.Data.Buckets[shardIndex]
+	bucketShard, ok := bucket.Buckets[shardIndex]
 	if !ok {
-		bucketShard = s.newBucket(shardKey, bucket.Data.Depth+1)
-		bucket.Data.Buckets[shardIndex] = bucketShard
+		bucketShard = s.newBucket(shardKey, bucket.Depth+1).BucketV2
+		bucket.Buckets[shardIndex] = bucketShard
 	}
 
 	if bucketShard == nil {
-		bucket.Unlock()
+		bucket.lock.Unlock()
 		return "", fmt.Errorf("bucket shard is nil")
 	}
 
@@ -219,19 +217,19 @@ func (s *StoragePackerV2) GetBucket(key string) (*LockedBucket, error) {
 
 	bucket.Size = int64(len(entry.Value))
 
-	return s.UpdateBucketCache(&LockedBucket{Data: &bucket}), nil
+	return s.UpdateBucketCache(&LockedBucket{BucketV2: &bucket}), nil
 }
 
 func (s *StoragePackerV2) UpdateBucketCache(bucket *LockedBucket) *LockedBucket {
 	var lb *LockedBucket
-	raw, exists := s.bucketsCache.Get(bucket.Data.Key)
+	raw, exists := s.bucketsCache.Get(bucket.Key)
 	if exists {
 		lb = raw.(*LockedBucket)
 	}
 	if lb == nil {
 		lb = bucket
 	}
-	s.bucketsCache.Insert(lb.Data.Key, lb)
+	s.bucketsCache.Insert(lb.Key, lb)
 	return lb
 }
 
@@ -241,28 +239,28 @@ func (s *StoragePackerV2) PutBucket(bucket *LockedBucket) error {
 		return fmt.Errorf("nil bucket entry")
 	}
 
-	if bucket.Data.Key == "" {
+	if bucket.Key == "" {
 		return fmt.Errorf("missing bucket key")
 	}
 
-	if !strings.HasPrefix(bucket.Data.Key, s.config.ViewPrefix) {
+	if !strings.HasPrefix(bucket.Key, s.config.ViewPrefix) {
 		return fmt.Errorf("bucket entry key should have %q prefix", s.config.ViewPrefix)
 	}
 
-	marshaledBucket, err := proto.Marshal(bucket.Data)
+	marshaledBucket, err := proto.Marshal(bucket.BucketV2)
 	if err != nil {
 		return err
 	}
 
 	err = s.config.View.Put(context.Background(), &logical.StorageEntry{
-		Key:   bucket.Data.Key,
+		Key:   bucket.Key,
 		Value: marshaledBucket,
 	})
 	if err != nil {
 		return err
 	}
 
-	bucket.Data.Size = int64(len(marshaledBucket))
+	bucket.Size = int64(len(marshaledBucket))
 
 	s.UpdateBucketCache(bucket)
 
@@ -288,17 +286,17 @@ func (s *StoragePackerV2) getItem(bucket *LockedBucket, itemID string) (*Item, e
 		return nil, nil
 	}
 
-	shardIndex, err := shardBucketIndex(itemID, int(bucket.Data.Depth), int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
+	shardIndex, err := shardBucketIndex(itemID, int(bucket.Depth), int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
 	if err != nil {
 		return nil, errwrap.Wrapf("failed to compute the bucket shard index: {{err}}", err)
 	}
 
-	shardKey := bucket.Data.Key + "/" + shardIndex
+	shardKey := bucket.Key + "/" + shardIndex
 
-	bucket.RLock()
+	bucket.lock.RLock()
 
-	if bucket.Data.Sharded {
-		bucket.RUnlock()
+	if bucket.Sharded {
+		bucket.lock.RUnlock()
 		bucketShard, err := s.GetBucket(shardKey)
 		if err != nil {
 			return nil, err
@@ -306,9 +304,9 @@ func (s *StoragePackerV2) getItem(bucket *LockedBucket, itemID string) (*Item, e
 		return s.getItem(bucketShard, itemID)
 	}
 
-	defer bucket.RUnlock()
+	defer bucket.lock.RUnlock()
 
-	bucketShard, ok := bucket.Data.Buckets[shardIndex]
+	bucketShard, ok := bucket.Buckets[shardIndex]
 	if !ok {
 		return nil, nil
 	}
@@ -335,17 +333,17 @@ func (s *StoragePackerV2) deleteItem(bucket *LockedBucket, itemID string) error 
 		return nil
 	}
 
-	shardIndex, err := shardBucketIndex(itemID, int(bucket.Data.Depth), int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
+	shardIndex, err := shardBucketIndex(itemID, int(bucket.Depth), int(s.config.BucketBaseCount), int(s.config.BucketShardCount))
 	if err != nil {
 		return errwrap.Wrapf("failed to compute the bucket shard index: {{err}}", err)
 	}
 
-	shardKey := bucket.Data.Key + "/" + shardIndex
+	shardKey := bucket.Key + "/" + shardIndex
 
-	bucket.Lock()
+	bucket.lock.Lock()
 
-	if bucket.Data.Sharded {
-		bucket.Unlock()
+	if bucket.Sharded {
+		bucket.lock.Unlock()
 		bucketShard, err := s.GetBucket(shardKey)
 		if err != nil {
 			return err
@@ -353,9 +351,9 @@ func (s *StoragePackerV2) deleteItem(bucket *LockedBucket, itemID string) error 
 		return s.deleteItem(bucketShard, itemID)
 	}
 
-	defer bucket.Unlock()
+	defer bucket.lock.Unlock()
 
-	bucketShard, ok := bucket.Data.Buckets[shardIndex]
+	bucketShard, ok := bucket.Buckets[shardIndex]
 	if !ok {
 		return nil
 	}
@@ -404,7 +402,7 @@ func (s *StoragePackerV2) bucketExceedsSizeLimit(bucket *LockedBucket, item *Ite
 		return false, fmt.Errorf("failed to marshal item: %v", err)
 	}
 
-	size := bucket.Data.Size + int64(len(marshaledItem))
+	size := bucket.Size + int64(len(marshaledItem))
 
 	// The objects that leave storage packer to get persisted get inflated due
 	// to extra bits coming off of encryption. So, we consider the bucket full
@@ -427,8 +425,8 @@ func (s *StoragePackerV2) BucketWalk(key string, fn BucketWalkFunc) error {
 		return nil
 	}
 
-	if !bucket.Data.Sharded {
-		for _, bucket := range bucket.Data.Buckets {
+	if !bucket.Sharded {
+		for _, bucket := range bucket.Buckets {
 			for _, item := range bucket.Items {
 				err := fn(item)
 				if err != nil {
@@ -440,7 +438,7 @@ func (s *StoragePackerV2) BucketWalk(key string, fn BucketWalkFunc) error {
 	}
 
 	for i := 0; i < s.config.BucketShardCount; i++ {
-		shardKey := bucket.Data.Key + "/" + strconv.FormatInt(int64(i), 16)
+		shardKey := bucket.Key + "/" + strconv.FormatInt(int64(i), 16)
 		err = s.BucketWalk(shardKey, fn)
 		if err != nil {
 			return err
@@ -451,7 +449,7 @@ func (s *StoragePackerV2) BucketWalk(key string, fn BucketWalkFunc) error {
 }
 
 func (s *StoragePackerV2) splitBucket(bucket *LockedBucket) error {
-	for _, shard := range bucket.Data.Buckets {
+	for _, shard := range bucket.Buckets {
 		for itemID, item := range shard.Items {
 			if shard.Buckets == nil {
 				shard.Buckets = make(map[string]*BucketV2)
@@ -463,20 +461,20 @@ func (s *StoragePackerV2) splitBucket(bucket *LockedBucket) error {
 			subShard, ok := shard.Buckets[subShardIndex]
 			if !ok {
 				subShardKey := shard.Key + "/" + subShardIndex
-				subShard = s.newBucket(subShardKey, shard.Depth+1)
+				subShard = s.newBucket(subShardKey, shard.Depth+1).BucketV2
 				shard.Buckets[subShardIndex] = subShard
 			}
 			subShard.Items[itemID] = item
 		}
 
 		shard.Items = nil
-		err := s.PutBucket(&LockedBucket{Data: shard})
+		err := s.PutBucket(&LockedBucket{BucketV2: shard})
 		if err != nil {
 			return err
 		}
 	}
-	bucket.Data.Buckets = nil
-	bucket.Data.Sharded = true
+	bucket.Buckets = nil
+	bucket.Sharded = true
 	return nil
 }
 
@@ -519,15 +517,16 @@ func bitsNeeded(value int) int {
 	return int(math.Ceil(math.Log2(float64(value))))
 }
 
-func (s *StoragePackerV2) newBucket(key string, depth int32) *BucketV2 {
-	bucket := &BucketV2{
-		Key:     key,
-		Buckets: make(map[string]*BucketV2),
-		Items:   make(map[string]*Item),
-		Depth:   depth,
+func (s *StoragePackerV2) newBucket(key string, depth int32) *LockedBucket {
+	return &LockedBucket{
+		lock: &sync.RWMutex{},
+		BucketV2: &BucketV2{
+			Key:     key,
+			Buckets: make(map[string]*BucketV2),
+			Items:   make(map[string]*Item),
+			Depth:   depth,
+		},
 	}
-
-	return bucket
 }
 
 // NewStoragePackerV2 creates a new storage packer for a given view
